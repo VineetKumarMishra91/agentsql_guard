@@ -1,0 +1,437 @@
+================================================================================================
+ AgentSQL-Guard with InvaCard  -  live demonstration
+ Foundation of Data Science, Group 13 (Umar, Sohailur, Vineet)  |  Faculty: Kalyanaraman P
+================================================================================================
+ Settings: scale factor 0.1, 4 parameter draws, 3 timed runs per plan, threads=2, output folder: /home/claude/final/run
+
+================================================================================================
+ STEP 1/11  BUILD THE DATABASE
+================================================================================================
+ We create an in-memory analytical database with the TPC-H schema (customers, orders, line
+ items, parts, suppliers). The same eight tables are used by every query in the study, so any
+ difference in speed between two queries comes from how they are written and planned, not from
+ the data.
+------------------------------------------------------------------------------------------------
+ Data source: built-in generator; scale factor 0.1; built in 4.6 s.
+
+ Table sizes
+    table   rows
+   region      5
+   nation     25
+ supplier   1000
+ customer  15000
+     part  20000
+ partsupp  80000
+   orders 150000
+ lineitem 600748
+
+================================================================================================
+ STEP 2/11  BUILD THE MATCHED THREE-ARM WORKLOAD
+================================================================================================
+ Each business question (an 'intent' taken from TPC-H) is written five ways: the official
+ expert SQL, SQL produced by an ORM library (SQLAlchemy Core), and three different LLM-agent
+ wordings. All five share the same parameter values, so the only thing that differs between
+ them is the wording.
+------------------------------------------------------------------------------------------------
+ 12 intents x 4 parameter draws x 5 formulations = 240 query instances.
+
+ Example intent Q21, draw 0. Question: Suppliers in IRAQ who were the only late supplier on multi-supplier finished orders, top 100 by count.
+   [expert ] select s_name, count(*) as numwait from supplier, lineitem l1, orders, nation where s_suppkey = l1.l_suppkey and o_orderkey = l1.l_orderkey and o_orde ...
+   [orm    ] SELECT supplier.s_name, count(*) AS numwait FROM supplier JOIN lineitem AS l1 ON l1.l_suppkey = supplier.s_suppkey JOIN orders ON orders.o_orderkey =  ...
+   [agent1 ] WITH order_supp AS ( SELECT l_orderkey, COUNT(DISTINCT l_suppkey) AS n_supp, COUNT(DISTINCT CASE WHEN l_receiptdate > l_commitdate THEN l_suppkey END) ...
+   [agent2 ] SELECT s.s_name, COUNT(*) AS numwait FROM supplier s JOIN nation n ON n.n_nationkey = s.s_nationkey JOIN lineitem l1 ON l1.l_suppkey = s.s_suppkey JOI ...
+   [agent3 ] SELECT s.s_name, COUNT(*) AS numwait FROM supplier s JOIN nation n ON n.n_nationkey = s.s_nationkey JOIN lineitem l1 ON l1.l_suppkey = s.s_suppkey JOI ...
+
+================================================================================================
+ STEP 3/11  CHECK THAT EVERY WORDING RETURNS THE SAME ANSWER
+================================================================================================
+ A fast query is useless if it is wrong, so every ORM and agent query is compared with the
+ expert query on the main database and on two smaller, randomly mutated databases. A wording is
+ accepted only if it returns exactly the same rows everywhere. Agreement on mutated data guards
+ against queries that are only right by luck.
+------------------------------------------------------------------------------------------------
+
+ Equivalence verdicts by arm
+    arm    verdict  queries
+  agent equivalent      143
+  agent   rejected        1
+ expert  reference       48
+    orm equivalent       48
+ 239 of 240 query instances are verified and go into the speed comparison. Rejected or
+ unverified wordings are reported as a correctness result and excluded from timing.
+
+================================================================================================
+ STEP 4/11  QUERY FINGERPRINTING ENGINE
+================================================================================================
+ Every query is parsed into a syntax tree. The syntactic fingerprint ignores constants and
+ formatting (what tools such as pg_stat_statements and AQO key on). The semantic fingerprint
+ first applies safe rewrites (qualify columns, unnest subqueries, merge CTEs, normalise
+ predicates) and keeps only the tables and predicates, so that different wordings of one
+ question can share a key.
+------------------------------------------------------------------------------------------------
+
+ Unit and property tests
+                                              test result
+        Constants ignored by syntactic fingerprint   PASS
+ Alias rename + spacing keeps semantic fingerprint   PASS
+   Different constant changes semantic fingerprint   PASS
+    CTE wording covers the same tables as the join   PASS
+           Different question gets a different key   PASS
+       Different operator (> vs <) changes the key   PASS
+
+ Fingerprint quality
+                                                    metric    value
+                                            Queries parsed      239
+                          Semantic parse/optimise failures 0 (0.0%)
+ Distinct syntactic fingerprints per question (5 wordings)     4.98
+  Distinct semantic fingerprints per question (5 wordings)     4.23
+                     Collapse ratio (syntactic / semantic)     1.18
+                    Collisions between different questions        0
+ Reading: the syntactic fingerprint gives a new key to almost every wording, so a correction
+ learned on one wording is never reused for another. The semantic fingerprint merges some of
+ them at query level; at the level of plan sub-expressions (Step 7) the merging is much
+ stronger.
+
+================================================================================================
+ STEP 5/11  MEASURE REAL LATENCY AND BUILD INDEPENDENT LABELS (TIER A)
+================================================================================================
+ Following the review feedback, we first measure real slowdowns. Each verified query is (a)
+ explained without running it, which is all the guard may see, (b) run once with profiling to
+ record the estimated and the true row count of every plan step, (c) timed with its own plan,
+ and (d) timed under five alternative optimizer configurations (hint sets) that force different
+ plans. Labels come only from these measurements, never from the guard's own rules.
+------------------------------------------------------------------------------------------------
+   measured   20/239 queries  (  3.0 s)
+   measured   40/239 queries  (  6.3 s)
+   measured   60/239 queries  (  8.7 s)
+   measured   80/239 queries  ( 12.2 s)
+   measured  100/239 queries  ( 16.0 s)
+   measured  120/239 queries  ( 21.0 s)
+   measured  140/239 queries  ( 22.8 s)
+   measured  160/239 queries  ( 26.1 s)
+   measured  180/239 queries  ( 28.5 s)
+   measured  200/239 queries  ( 40.3 s)
+   measured  220/239 queries  ( 43.5 s)
+   measured  239/239 queries  ( 95.8 s)
+
+ Latency and regression labels by author arm (ms)
+    arm  queries median_ms p95_ms  max_ms  slow_wording  plan_regression  any_regression regression_rate
+  agent      143     14.91 154.31 1438.90            16                0              16            0.11
+ expert       48     14.24  26.00   28.21             0                0               0            0.00
+    orm       48     13.13  26.77   29.94             0                0               0            0.00
+
+ Ten slowest wordings relative to the fastest equivalent wording
+           qid native_ms best_wording_ms R_form                    best_hint R_hint
+ Q21_d1_agent3   1342.29           17.78  75.51            H5_no_deliminator   1.20
+ Q21_d0_agent3   1438.90           19.22  74.87             H1_no_join_order   1.10
+ Q21_d3_agent3   1048.41           20.78  50.45                       native   1.00
+ Q21_d2_agent3   1099.45           22.35  49.18 H4_no_statistics_propagation   1.06
+ Q18_d3_agent3    171.44           14.91  11.50   H3_no_join_filter_pushdown   1.34
+ Q18_d0_agent3    161.18           17.09   9.43                       native   1.00
+ Q18_d1_agent3    169.76           19.59   8.67            H5_no_deliminator   1.27
+ Q18_d2_agent3    156.28           18.05   8.66            H5_no_deliminator   1.06
+ Q21_d0_agent1    136.59           19.22   7.11 H4_no_statistics_propagation   1.25
+ Q21_d1_agent1    106.11           17.78   5.97                       native   1.00
+ Label definitions: a 'slow wording' runs at least 2x slower (and 10 ms slower) than the
+ fastest verified wording of the same question with the same parameters; a 'plan regression'
+ runs at least 2x slower than under the best alternative optimizer configuration. Both are
+ measured, not predicted.
+   [chart saved: /home/claude/final/run/fig1_runtime_by_arm.png]
+
+================================================================================================
+ STEP 6/11  LOOK INSIDE THE WORST AGENT WORDING
+================================================================================================
+ To see why an agent wording is slow, we print its plan next to the expert plan for the same
+ question: for each step, the optimizer's estimated rows, the true rows, and the time spent.
+ Large gaps between estimated and true rows (the q-error) show where the cardinality estimator
+ went wrong.
+------------------------------------------------------------------------------------------------
+
+ EXPERT: Q21_d1_expert  runtime 20.3 ms
+   TOP_N                      est=        37 true=        35 q=     1.1 time=     0.0ms
+     HASH_GROUP_BY              est=        37 true=        35 q=     1.1 time=     1.2ms
+       HASH_JOIN           INNER  est=        38 true=       351 q=     9.2 time=     0.8ms o_orderkey = l_orderkey
+         TABLE_SCAN                 est=     75000 true=     72857 q=     1.0 time=     2.5ms (o_orderstatus = 'F')
+         HASH_JOIN           RIGHT_SEMI est=       150 true=       675 q=     4.5 time=     2.6ms l_orderkey = l_orderkey
+           TABLE_SCAN                 est=    600748 true=    600748 q=     1.0 time=     0.5ms memory.main.lineitem
+           HASH_JOIN           RIGHT_ANTI est=       750 true=      1134 q=     1.5 time=     6.7ms l_orderkey IS NOT DISTINCT FROM l_orderkey
+             FILTER                     est=    120149 true=    379249 q=     3.2 time=     1.3ms
+               TABLE_SCAN                 est=    600748 true=    600748 q=     1.0 time=     1.0ms
+             HASH_JOIN           INNER  est=      3750 true=     13132 q=     3.5 time=     2.0ms l_suppkey = s_suppkey
+               FILTER                     est=    120149 true=    379249 q=     3.2 time=     1.1ms
+                 TABLE_SCAN                 est=    600748 true=    600748 q=     1.0 time=     1.1ms
+               HASH_JOIN           INNER  est=        38 true=        35 q=     1.1 time=     0.1ms s_nationkey = n_nationkey
+                 TABLE_SCAN                 est=      1000 true=      1000 q=     1.0 time=     0.0ms memory.main.supplier
+                 TABLE_SCAN                 est=         1 true=         1 q=     1.0 time=     0.0ms (n_name = 'INDIA')
+
+ AGENT (worst): Q21_d1_agent3  runtime 1342.3 ms
+   TOP_N                      est=        37 true=        35 q=     1.1 time=     0.1ms
+     HASH_GROUP_BY              est=        37 true=        35 q=     1.1 time=     1.6ms
+       HASH_JOIN           INNER  est=       966 true=      6238 q=     6.5 time=     2.2ms o_orderkey = l_orderkey
+         TABLE_SCAN                 est=     75000 true=     72857 q=     1.0 time=     2.5ms (o_orderstatus = 'F')
+         HASH_JOIN           INNER  est=      3750 true=     13132 q=     3.5 time=     1.6ms l_suppkey = s_suppkey
+           FILTER                     est=    120149 true=    379249 q=     3.2 time=     0.8ms
+             TABLE_SCAN                 est=    600748 true=    600748 q=     1.0 time=     1.0ms
+           HASH_JOIN           INNER  est=        38 true=        35 q=     1.1 time=     0.1ms s_nationkey = n_nationkey
+             TABLE_SCAN                 est=      1000 true=      1000 q=     1.0 time=     0.0ms memory.main.supplier
+             TABLE_SCAN                 est=         1 true=         1 q=     1.0 time=     0.0ms (n_name = 'INDIA')
+       FILTER                     est=       193 true=      6005 q=    31.1 time=     0.0ms
+         HASH_JOIN           MARK   est=       966 true=      6238 q=     6.5 time=  1177.7ms l_suppkey IS NOT DISTINCT FROM l_suppkey
+           CTE_SCAN                   est=       966 true=      6238 q=     6.5 time=     0.0ms
+           NESTED_LOOP_JOIN    INNER  est=   2524831 true=  21005290 q=     8.3 time=    39.8ms l_suppkey != l_suppkey
+             TABLE_SCAN                 est=    600748 true=    600748 q=     1.0 time=     2.2ms memory.main.lineitem
+             PERFECT_HASH_GROUP_BY       est=       483 true=        35 q=    13.8 time=     0.0ms
+               CTE_SCAN                   est=       966 true=      6238 q=     6.5 time=     0.0ms
+       FILTER                     est=        38 true=       351 q=     9.2 time=     0.1ms
+         HASH_JOIN           MARK   est=       193 true=      6005 q=    31.1 time=   896.8ms l_suppkey IS NOT DISTINCT FROM l_suppkey
+           CTE_SCAN                   est=       193 true=      6005 q=    31.1 time=     0.0ms
+           NESTED_LOOP_JOIN    INNER  est=    100365 true=  13260583 q=   132.1 time=    42.3ms l_suppkey != l_suppkey
+             FILTER                     est=    120149 true=    379249 q=     3.2 time=     1.7ms
+               TABLE_SCAN                 est=    600748 true=    600748 q=     1.0 time=     3.0ms
+             PERFECT_HASH_GROUP_BY       est=        96 true=        35 q=     2.7 time=     0.0ms
+               CTE_SCAN                   est=       193 true=      6005 q=    31.1 time=     0.0ms
+ The agent wording Q21_d1_agent3 returns exactly the same rows as the expert query but runs
+ 75.5x slower. The plan shows the decorrelated subquery producing far more intermediate rows
+ than the optimizer expected; this is the kind of wording-dependent estimation error InvaCard
+ targets.
+
+================================================================================================
+ STEP 7/11  FORMULATION-PATH BIAS AND THE COHERENCE CERTIFICATE
+================================================================================================
+ Two wordings of the same question contain many identical logical sub-expressions (for example
+ 'orders joined to lineitem with the same filters'). Their true row counts are equal, so their
+ estimates should be equal too (coherence law L1). Here we measure how often the estimator
+ breaks this, and how its error depends on the formulation path (plain join, semi/anti join,
+ mark join from a subquery, CTE scan, ...).
+------------------------------------------------------------------------------------------------
+
+ Native estimator q-error by formulation path
+    path  nodes median_q   p90_q    max_q
+  filter    200     3.16 5149.90 66159.00
+    semi     88     3.79  178.17   239.82
+ nl_join     28    31.90  141.18   491.38
+     agg    367     5.00  120.50 66159.00
+   limit     99     1.16  100.00   100.00
+    anti     16     1.51   31.76    32.12
+     cte    136     2.40   29.90    38.91
+    join    681     1.82   29.57 32062.00
+    mark     56     4.63    6.44    38.91
+    scan   1024     1.00    5.16   200.00
+
+ Native estimator q-error by author arm
+    arm  nodes median_q p90_q    p99_q frac_q_gt_10
+  agent   1631     1.36 29.57 26189.00         0.15
+ expert    532     1.56 51.00 50832.00         0.24
+    orm    532     1.56 51.00 50832.00         0.24
+ 528 logical sub-expressions appear in two or more wordings of the same question. In 12 of them
+ (2.3%) the estimator's numbers differ by 2x or more between wordings, and in 4 by 10x or more,
+ although their true row counts are identical. (Key precision check: 100.0% of shared semantic
+ keys have identical true row counts in every wording.) This is direct evidence of wording-
+ dependent estimates.
+
+ Largest estimate disagreements for the same sub-expression
+ intent path  n_queries est_spread true_spread
+    Q21 join          5      32.04        1.00
+    Q21 join          5      32.04        1.00
+    Q21 join          5      32.04        1.00
+    Q21 join          5      32.04        1.00
+    Q16  agg          2       4.00        1.00
+    Q16  agg          2       4.00        1.00
+    Q16  agg          2       4.00        1.00
+    Q16  agg          2       4.00        1.00
+ Coherence certificate: computed from estimates only (no execution) for 239 plans; it detected
+ provably inconsistent estimates in 36 plans. Soundness check (certified bound <= observed
+ worst q-error) holds for ALL plans.
+   [chart saved: /home/claude/final/run/fig2_estimate_spread.png]
+
+================================================================================================
+ STEP 8/11  INVACARD: FORMULATION-INVARIANT CARDINALITY CORRECTION
+================================================================================================
+ InvaCard corrects the optimizer's row estimates. It remembers true row counts under the
+ meaning of each sub-expression (not its wording), learns a residual correction with gradient-
+ boosted trees, only applies a learned correction when it is outside a conformal uncertainty
+ band for that formulation path, and projects its outputs so that they obey the coherence laws.
+ Protocol P1 trains on expert and ORM queries only and tests on the agent wordings it has never
+ seen; protocol P2 holds out a whole question.
+------------------------------------------------------------------------------------------------
+
+ P1 leave-arm-out: q-error on agent-written sub-expressions (lower is better)
+                                method  nodes median   p90    p95      p99      max frac_gt_10
+                   B0 native estimator   1631   1.36 29.57 100.00 26189.00 66159.00       0.15
+       B2 syntactic memory (AQO-style)   1631   1.36 29.57 100.00 26189.00 66159.00       0.15
+               B3 semantic memory only   1631   1.00 14.99  63.87 26189.00 66159.00       0.12
+              B5 learned residual only   1631   1.15  9.86  91.06  6994.96 41971.26       0.10
+                       InvaCard (full)   1631   1.00  9.61  68.04  4733.40 24939.16       0.10
+                 InvaCard without gate   1631   1.00  8.74  67.67  6994.96 41971.26       0.09
+ InvaCard without coherence projection   1631   1.00 11.15  80.94  4733.40 24939.16       0.10
+      InvaCard without semantic memory   1631   1.32 13.74  68.04  4733.40 24939.16       0.11
+ Key hit rate on agent sub-expressions: syntactic keys 0.0%, semantic keys 55.5%. Sources used
+ by full InvaCard: {'memory': 906, 'kept native': 248, 'model (gated)': 477, 'clipped by laws':
+ 120}.
+
+ P1 by formulation path: 90th percentile q-error
+    path  nodes native_p90 invacard_p90
+    scan    632       5.11         1.00
+  filter    120    5149.90         8.50
+    join    425      17.50        20.07
+ nl_join     20     171.14       721.24
+    semi     48      40.00       111.02
+    anti      8      31.87         4.81
+    mark     32      25.93        32.06
+     cte     72      25.93        32.06
+     agg    215      62.96       219.93
+   limit     59     100.00         2.89
+ InvaCard is worse than the native estimator on these paths: join, nl_join, semi, mark, cte,
+ agg. These paths have few training examples from the expert and ORM wordings, so the learned
+ correction extrapolates; the full design adds the plan-change test of the gate (PostgreSQL +
+ pg_hint_plan) to stop such corrections.
+ Coherence-law violations on agent plans: native estimator 12, learned residual alone 128,
+ InvaCard after projection 0.
+
+ P2 leave-one-question-out (memory cannot help here): q-error
+                   method  nodes median   p90    p95      p99       max frac_gt_10
+      B0 native estimator   2695   1.42 31.82 120.50 50832.00  66159.00       0.19
+ B5 learned residual only   2695   2.02 69.09 147.37 11962.82 110211.18       0.22
+          InvaCard (full)   2695   1.65 49.26 105.24 20959.72  66159.00       0.22
+ Reading: on unseen agent wordings (P1) InvaCard lowers the 90th percentile q-error from 29.6
+ to 9.6 and the 99th percentile from 26189 to 4733. The syntactic (AQO-style) memory cannot
+ help at all because no agent sub-expression has the same syntactic key (p90 29.6), while 55.5%
+ of them are found through semantic keys. The learned residual alone is competitive in the
+ middle of the distribution (p90 9.9) but has a heavier tail (p99 6995) and breaks the
+ coherence laws 128 times; the gate and projection trade a little typical accuracy for a much
+ safer tail. On completely new questions (P2) memory cannot apply: InvaCard p90 49.3 vs native
+ 31.8 vs ungated residual 69.1, which shows why the gate matters when the model is outside what
+ it has seen.
+   [chart saved: /home/claude/final/run/fig3_qerror_cdf.png]
+
+================================================================================================
+ STEP 9/11  STAGE ONE: PREDICTING REGRESSIONS BEFORE EXECUTION (M1 TO M5)
+================================================================================================
+ The guard must decide before a query runs, so it may only use the SQL text, the catalog and
+ the EXPLAIN plan. As the review asked, we compare four detectors: M1 novelty only, M2
+ complexity only, M3 plan features only, M4 all three combined, plus M5 = M4 with the coherence
+ certificate. We test two situations: (A) the guard has seen the question before but with other
+ parameter values (leave-one-draw-out), and (B) the question is completely new (leave-one-
+ intent-out, the harder case). Area under the precision-recall curve (AUPRC) is the main score
+ because regressions are rare.
+------------------------------------------------------------------------------------------------
+ Positives (measured regressions) among 239 verified queries: 16 (base rate 6.7%); a detector
+ that guesses scores AUPRC = 0.067.
+
+ Detection quality, protocol A: new parameters (leave-one-draw-out)
+                  detector         model AUPRC ROC_AUC recall_at_5pct_FPR
+             M2 complexity boosted trees  1.00    1.00               1.00
+                   M3 plan boosted trees  1.00    1.00               1.00
+   M4 combined (SQL-Guard) boosted trees  1.00    1.00               1.00
+ M5 combined + certificate boosted trees  1.00    1.00               1.00
+                M1 novelty boosted trees  0.25    0.82               0.50
+                   M3 plan      logistic  1.00    1.00               1.00
+   M4 combined (SQL-Guard)      logistic  1.00    1.00               1.00
+ M5 combined + certificate      logistic  1.00    1.00               1.00
+             M2 complexity      logistic  0.59    0.98               1.00
+                M1 novelty      logistic  0.08    0.52               0.08
+
+ Detection quality, protocol B: new question (leave-one-intent-out)
+                  detector         model AUPRC ROC_AUC recall_at_5pct_FPR
+                   M3 plan boosted trees  0.52    0.96               0.65
+   M4 combined (SQL-Guard) boosted trees  0.52    0.96               0.65
+ M5 combined + certificate boosted trees  0.52    0.96               0.65
+                M1 novelty boosted trees  0.08    0.41               0.00
+             M2 complexity boosted trees  0.04    0.08               0.00
+ M5 combined + certificate      logistic  0.50    0.90               0.25
+                   M3 plan      logistic  0.44    0.91               0.50
+   M4 combined (SQL-Guard)      logistic  0.18    0.80               0.00
+                M1 novelty      logistic  0.12    0.46               0.00
+             M2 complexity      logistic  0.05    0.15               0.00
+ Protocol A: new parameters (leave-one-draw-out): M4 minus the best single-group detector (M3
+ plan), intent-level bootstrap 95% CI for the AUPRC difference: [+0.000, +0.000]. Both
+ detectors rank every regression first here, so they cannot be separated; protocol B is the
+ informative comparison.
+ Why protocol A is easy: a wording that is slow for one set of parameters is usually slow for
+ the others too, and its EXPLAIN plan already shows the warning signs (nested-loop or mark
+ joins from subqueries, very large estimated intermediate results).
+ For a completely new question (protocol B) the task is much harder, which is why the paper
+ pairs stage one with stage-two monitoring and the experience memory.
+   [chart saved: /home/claude/final/run/fig4_detection_pr.png]
+
+================================================================================================
+ STEP 10/11  TIER B: CONTROLLED FAULT INJECTION AND EXACT CAUSE SHARES
+================================================================================================
+ A slow query is not automatically the optimizer's fault. For a sample of queries we switch
+ four causes on and off in every combination: W = the agent's wording vs the fastest equivalent
+ wording, P = the native plan vs the best alternative optimizer configuration, K = CPU
+ contention from background queries, R = restricted resources (1 thread). Shapley values then
+ split each slowdown exactly among the four causes. We also run the leakage test: stage-one
+ inputs must not change when only the runtime conditions (K, R) change.
+------------------------------------------------------------------------------------------------
+
+ Shapley cause shares of the slowdown (all-faulty vs all-normal)
+           qid      label slowdown_x wording_% plan_% contention_% resources_%
+ Q21_d1_agent3 regression      135.5      81.5    0.7         12.2         5.6
+ Q21_d0_agent3 regression       80.3      75.2    7.0         11.0         6.8
+ Q21_d3_agent3 regression       50.0      70.4    9.8         14.8         5.0
+ Q21_d2_agent3 regression      133.3      80.1    1.1         12.2         6.6
+  Q3_d1_agent3     normal        1.9      24.0    9.3         64.7         2.0
+ Q11_d0_agent2     normal        1.4      19.2    5.2         63.2        12.4
+ Q18_d1_agent1     normal        0.9       7.3   33.1         45.7        13.9
+ Q17_d2_agent2     normal        1.4      16.4    0.6         65.3        17.6
+ For the measured regressions, the wording explains on average 77% of the slowdown, the plan
+ choice 5%, contention 13% and restricted resources 6%. Leakage invariance test: PASS - stage-
+ one inputs were identical under every runtime condition.
+ Note: DuckDB runs in memory and uses MVCC, so the cold-cache and lock factors of the full
+ PostgreSQL design cannot be reproduced in this demo; contention and resource limits stand in
+ for environmental causes.
+   [chart saved: /home/claude/final/run/fig5_shapley.png]
+
+================================================================================================
+ STEP 11/11  MITIGATION POLICIES AND DECISION CURVES
+================================================================================================
+ A guard is only useful if acting on its warnings helps more than it hurts. Using the measured
+ runtimes we replay what each policy would have done for every query, using the out-of-sample
+ risk scores of the M4 detector. We count regressions prevented and unnecessary interventions
+ on healthy queries, and draw a decision curve: the net benefit of acting at each risk
+ threshold compared with acting on all or none.
+------------------------------------------------------------------------------------------------
+
+ Policy replay, risk scores from protocol A: new parameters (leave-one-draw-out), threshold 0.5
+                            policy  flagged  regressions  prevented  unnecessary mean_ms   p95_ms total_s                          note
+               No guard (log only)        0           16          0            0   40.25    80.05    9.62                      baseline
+                              Warn       16           16          0            0   40.25    80.05    9.62 alert only; latency unchanged
+    Rewrite to verified equivalent       16           16         16            0   15.22    26.20    3.64    semantic experience memory
+    Switch optimizer configuration       16           16          0            0   37.81    70.66    9.04    best hint set (optimistic)
+ Timeout 3x expected, then rewrite       16           16          6            0   19.57    81.03    4.68        pays the timeout first
+                      Human review       16           16          0            0 2023.58 30020.35  483.64  30 s delay per flagged query
+
+ Same replay with risk scores for completely new questions (protocol B)
+                            policy  flagged  regressions  prevented  unnecessary mean_ms p95_ms total_s                          note
+                              Warn       12           16          0            4   40.25  80.05    9.62 alert only; latency unchanged
+    Rewrite to verified equivalent       12           16          8            4   18.36  26.92    4.39    semantic experience memory
+ Timeout 3x expected, then rewrite       12           16          4            4   20.80  77.54    4.97        pays the timeout first
+   [chart saved: /home/claude/final/run/fig6_decision_curve.png]
+ At the operating threshold 0.50, acting on SQL-Guard's warnings (protocol A) gives a net
+ benefit of 0.067, while intervening on every query gives -0.866 and doing nothing gives 0. A
+ positive gap means the guard's warnings are worth acting on at that threshold.
+
+================================================================================================
+ SUMMARY
+================================================================================================
+ Verified queries in the speed comparison                           239 of 240
+ Regression rate: agent vs expert wordings                          11.2% vs 0.0%
+ Worst agent wording vs fastest equivalent                          Q21_d1_agent3: 75.5x slower, same answer
+ Same sub-expression estimated >=2x differently across wordings     12 of 528
+ Coherence certificate: plans flagged / sound on all plans          36 / yes
+ P1 q-error p90: native -> InvaCard                                 29.57 -> 9.61
+ P1 q-error p99: native -> InvaCard                                 26189.0 -> 4733.4
+ Key reuse on agent sub-expressions: syntactic vs semantic          0.0% vs 55.5%
+ Law violations: native -> residual only -> InvaCard                12 -> 128 -> 0
+ Stage-one M4 AUPRC, seen question / new question (base rate)       1.000 / 0.515 (0.067)
+ M4 - M3 plan AUPRC, 95% CI                                         [+0.000, +0.000]
+ Leakage invariance test                                            PASS
+ Rewrite policy: regressions prevented / unnecessary interventions  16 of 16 / 0
+================================================================================================
+ Finished in 408 s.
+ HTML report : /home/claude/final/run/AgentSQL_Guard_Demo_Report.html
+ Data files  : measurements.csv, subplan_cardinalities.csv, equivalence_checks.csv in /home/claude/final/run
+ Note: this is a pilot-scale demonstration on an embedded engine (DuckDB). Exact numbers depend on the machine;
+ the full study runs the same pipeline on PostgreSQL 16 with pg_hint_plan as described in the paper.
+================================================================================================

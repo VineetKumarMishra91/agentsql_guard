@@ -1,0 +1,8 @@
+duckdb>=2.0,<3
+numpy
+pandas
+scikit-learn
+scipy
+sqlglot
+sqlalchemy
+matplotlib
